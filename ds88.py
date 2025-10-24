@@ -1928,10 +1928,10 @@ def send_telegram_notification(message):
         if not bot_token or not chat_id:
             return False
         
-        url = f"https://api.telegram.org/bot8070179098:AAELUecfJYow2vgfGsOSs-jQ15EBX48Zr1o/sendMessage"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         
         data = {
-            "chat_id": DeepS2088Bot,
+            "chat_id":chat_id,
             "text": message,
             "parse_mode": "HTML"
         }
