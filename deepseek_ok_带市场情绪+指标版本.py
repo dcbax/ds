@@ -4,11 +4,11 @@ import schedule
 from openai import OpenAI
 import ccxt
 import pandas as pd
-from datetime import datetime
-import json
 import re
 from dotenv import load_dotenv
-
+import json
+import requests
+from datetime import datetime, timedelta
 load_dotenv()
 
 # 初始化DeepSeek客户端
@@ -141,6 +141,102 @@ def get_support_resistance_levels(df, lookback=20):
     except Exception as e:
         print(f"支撑阻力计算失败: {e}")
         return {}
+
+
+def get_sentiment_indicators():
+    """获取情绪指标 - 修复空值问题版本"""
+    try:
+        API_URL = "https://service.cryptoracle.network/openapi/v2/endpoint"
+        API_KEY = "b54bcf4d-1bca-4e8e-9a24-22ff2c3d76d5"
+
+        # 获取最近4小时数据
+        end_time = datetime.now()
+        start_time = end_time - timedelta(hours=4)
+
+        request_body = {
+            "apiKey": API_KEY,
+            "endpoints": ["CO-A-02-01", "CO-A-02-02", "CO-A-01-03"],
+            "startTime": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "endTime": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "timeType": "15m",
+            "token": ["BTC"]
+        }
+
+        headers = {"Content-Type": "application/json", "X-API-KEY": API_KEY}
+        response = requests.post(API_URL, json=request_body, headers=headers)
+
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("code") == 200 and data.get("data"):
+                time_periods = data["data"][0]["timePeriods"]
+
+                # 🔴 修复：查找第一个有有效数据的时间段（跳过空值）
+                for period in time_periods:
+                    period_data = period.get("data", [])
+
+                    # 检查这个时间段是否有有效数据
+                    sentiment = {}
+                    community_activity = None
+                    valid_data_found = False
+
+                    for item in period_data:
+                        endpoint = item.get("endpoint")
+                        value = item.get("value", "").strip()
+
+                        if value:  # 只处理非空值
+                            if endpoint in ["CO-A-02-01", "CO-A-02-02"]:
+                                try:
+                                    sentiment[endpoint] = float(value)
+                                    valid_data_found = True
+                                except (ValueError, TypeError):
+                                    continue
+                            elif endpoint == "CO-A-01-03":
+                                try:
+                                    community_activity = float(value)
+                                except (ValueError, TypeError):
+                                    community_activity = None
+
+                    # 如果找到有效数据，就使用这个时间段
+                    if valid_data_found and "CO-A-02-01" in sentiment and "CO-A-02-02" in sentiment:
+                        positive = sentiment['CO-A-02-01']
+                        negative = sentiment['CO-A-02-02']
+                        net_sentiment = positive - negative
+
+                        # 🔴 修复：安全处理community_activity
+                        activity_text = ""
+                        if community_activity is not None:
+                            if community_activity > 0.7:
+                                activity_text = "🔥 社区活跃度极高"
+                            elif community_activity > 0.4:
+                                activity_text = "💹 社区活跃度中等"
+                            else:
+                                activity_text = "📉 社区活跃度较低"
+
+                        data_delay = (datetime.now() - datetime.strptime(period['startTime'],
+                                                                         '%Y-%m-%d %H:%M:%S')).seconds // 60
+
+                        print(f"✅ 使用情绪数据时间: {period['startTime']} (延迟: {data_delay}分钟)")
+
+                        return {
+                            'positive_ratio': positive,
+                            'negative_ratio': negative,
+                            'net_sentiment': net_sentiment,
+                            'sentiment_strength': abs(net_sentiment),
+                            'bullish_bias': net_sentiment > 0.1,
+                            'bearish_bias': net_sentiment < -0.1,
+                            'community_activity': community_activity,
+                            'activity_text': activity_text,  # 添加文本描述
+                            'data_time': period['startTime'],
+                            'data_delay_minutes': data_delay
+                        }
+
+                print("❌ 所有时间段数据都为空")
+                return None
+
+        return None
+    except Exception as e:
+        print(f"情绪指标获取失败: {e}")
+        return None
 
 
 def get_market_trend(df):
@@ -343,9 +439,32 @@ def analyze_with_deepseek(price_data):
         last_signal = signal_history[-1]
         signal_text = f"\n【上次交易信号】\n信号: {last_signal.get('signal', 'N/A')}\n信心: {last_signal.get('confidence', 'N/A')}"
 
+    # 获取情绪数据
+    sentiment_data = get_sentiment_indicators()
+    # 修复：安全构建情绪文本
+    if sentiment_data:
+        sign = '+' if sentiment_data['net_sentiment'] >= 0 else ''
+        sentiment_text = f"【市场情绪】乐观{sentiment_data['positive_ratio']:.1%} 悲观{sentiment_data['negative_ratio']:.1%} 净值{sign}{sentiment_data['net_sentiment']:.3f}"
+
+        if sentiment_data['bullish_bias']:
+            sentiment_text += " 🚀强烈看涨"
+        elif sentiment_data['bearish_bias']:
+            sentiment_text += " ⚠️强烈看跌"
+        else:
+            sentiment_text += " ⚖️情绪中性"
+
+        # 安全添加社区活跃度信息
+        if sentiment_data.get('activity_text'):
+            sentiment_text += f"\n{sentiment_data['activity_text']}"
+    else:
+        sentiment_text = "【市场情绪】数据暂不可用"
+
+    print(sentiment_text)
+
     # 添加当前持仓信息
     current_pos = get_current_position()
     position_text = "无持仓" if not current_pos else f"{current_pos['side']}仓, 数量: {current_pos['size']}, 盈亏: {current_pos['unrealized_pnl']:.2f}USDT"
+    pnl_text = f", 持仓盈亏: {current_pos['unrealized_pnl']:.2f} USDT" if current_pos else ""
 
     prompt = f"""
     你是一个专业的加密货币交易分析师。请基于以下BTC/USDT {TRADE_CONFIG['timeframe']}周期数据进行分析：
@@ -356,6 +475,8 @@ def analyze_with_deepseek(price_data):
 
     {signal_text}
 
+    {sentiment_text}  # 添加情绪分析
+
     【当前行情】
     - 当前价格: ${price_data['price']:,.2f}
     - 时间: {price_data['timestamp']}
@@ -363,8 +484,7 @@ def analyze_with_deepseek(price_data):
     - 本K线最低: ${price_data['low']:,.2f}
     - 本K线成交量: {price_data['volume']:.2f} BTC
     - 价格变化: {price_data['price_change']:+.2f}%
-    - 当前持仓: {position_text}
-    - 持仓盈亏: {current_pos['unrealized_pnl']:.2f} USDT" if current_pos else "持仓盈亏: 0 USDT
+    - 当前持仓: {position_text}{pnl_text}
 
     【防频繁交易重要原则】
     1. **趋势持续性优先**: 不要因单根K线或短期波动改变整体趋势判断
@@ -373,15 +493,22 @@ def analyze_with_deepseek(price_data):
     4. **成本意识**: 减少不必要的仓位调整，每次交易都有成本
 
     【交易指导原则 - 必须遵守】
-    1. **趋势跟随**: 明确趋势出现时立即行动，不要过度等待
-    2. 因为做的是btc，做多权重可以大一点点
-    3. **信号明确性**:
+    1. **技术分析主导** (权重60%)：趋势、支撑阻力、K线形态是主要依据
+    2. **市场情绪辅助** (权重30%)：情绪数据用于验证技术信号，不能单独作为交易理由  
+    - 情绪与技术同向 → 增强信号信心
+    - 情绪与技术背离 → 以技术分析为主，情绪仅作参考
+    - 情绪数据延迟 → 降低权重，以实时技术指标为准
+    3. **风险管理** (权重10%)：考虑持仓、盈亏状况和止损位置
+    4. **趋势跟随**: 明确趋势出现时立即行动，不要过度等待
+    5. 因为做的是btc，做多权重可以大一点点
+    6. **信号明确性**:
     - 强势上涨趋势 → BUY信号
     - 强势下跌趋势 → SELL信号  
     - 仅在窄幅震荡、无明确方向时 → HOLD信号
-    4. **技术指标权重**:
+    7. **技术指标权重**:
     - 趋势(均线排列) > RSI > MACD > 布林带
-    - 价格突破关键支撑/阻力位是重要信号
+    - 价格突破关键支撑/阻力位是重要信号 
+    
 
     【当前技术状况分析】
     - 整体趋势: {price_data['trend_analysis'].get('overall', 'N/A')}
@@ -533,7 +660,7 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'buy',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={'tag': '60bb4a8d3416BCDE'}
                 )
             elif current_position and current_position['side'] == 'long':
                 print("已有多头持仓，保持现状")
@@ -544,7 +671,7 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'buy',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={'tag': '60bb4a8d3416BCDE'}
                 )
 
         elif signal_data['signal'] == 'SELL':
@@ -555,7 +682,7 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'sell',
                     current_position['size'],
-                    params={'reduceOnly': True, 'tag': 'f1ee03b510d5SUDE'}
+                    params={'reduceOnly': True, 'tag': '60bb4a8d3416BCDE'}
                 )
                 time.sleep(1)
                 # 开空仓
@@ -563,7 +690,7 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'sell',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={'tag': '60bb4a8d3416BCDE'}
                 )
             elif current_position and current_position['side'] == 'short':
                 print("已有空头持仓，保持现状")
@@ -574,7 +701,7 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'sell',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={'tag': '60bb4a8d3416BCDE'}
                 )
 
         print("订单执行成功")
