@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-🚀 DeepSeek增强版合约交易机器人 - 完整优化版
+🚀 DeepSeek增强版合约交易机器人 - 完整优化版 V2.1
 🎯 多策略决策引擎 + 动态仓位管理 + 严格风控
-💰 目标:每日波段高胜率收益
+🌟 新增: 市场情绪分析 (Funding/OI) + 条件止损系统 + 夏普比率自适应风险
+🔧 V2.1更新: 周期改为10分钟, 增加AI原始回复打印
 """
 
 import os
@@ -24,13 +25,14 @@ import traceback
 from openai import OpenAI
 import signal
 import sys
+import re # 导入 re 模块
 
 # ==================== 🎨 日志配置 ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('deepseek_trading.log', encoding='utf-8'),
+        logging.FileHandler('deepseek_trading_v2.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -172,8 +174,8 @@ TRADE_CONFIG = {
         'stats_interval': 1800  # 30分钟输出统计
     },
     
-    # 🧪 测试模式
-    'test_mode': True
+    # 🧪 测试模式 (V2.1: 默认改为False, 使用 --test 启动测试)
+    'test_mode': False
 }
 
 # ==================== 📊 全局状态管理 ====================
@@ -191,6 +193,7 @@ class TradingState:
         self.initial_balance = 0.0
         self.signals_history = defaultdict(list)
         self.market_data = defaultdict(dict)
+        self.sharpe_ratio = 0.0  # 🌟 新增: 夏普比率
         
         # 策略表现追踪
         self.strategy_performance = {
@@ -240,7 +243,8 @@ class TradingState:
             'daily_pnl': self.daily_pnl,
             'daily_pnl_percent': (self.daily_pnl / self.initial_balance * 100) if self.initial_balance > 0 else 0,
             'open_positions': len(self.positions),
-            'consecutive_losses': self.consecutive_losses
+            'consecutive_losses': self.consecutive_losses,
+            'sharpe_ratio': self.sharpe_ratio # 🌟 新增
         }
 
 # 初始化状态管理器
@@ -278,7 +282,9 @@ class AdvancedTradeDatabase:
                 market_condition TEXT,
                 status TEXT,
                 exit_reason TEXT,
-                duration_seconds INTEGER
+                duration_seconds INTEGER,
+                justification TEXT,
+                invalidation_condition TEXT
             )
         ''')
         
@@ -342,8 +348,9 @@ class AdvancedTradeDatabase:
                     timestamp, symbol, strategy, side, entry_price, exit_price,
                     quantity, leverage, pnl, pnl_percent, confidence,
                     stop_loss, take_profit, risk_reward_ratio, market_condition, 
-                    status, exit_reason, duration_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, exit_reason, duration_seconds,
+                    justification, invalidation_condition
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 datetime.now().isoformat(),
                 trade_data.get('symbol'),
@@ -362,7 +369,9 @@ class AdvancedTradeDatabase:
                 trade_data.get('market_condition', 'neutral'),
                 trade_data.get('status', 'open'),
                 trade_data.get('exit_reason', ''),
-                trade_data.get('duration_seconds', 0)
+                trade_data.get('duration_seconds', 0),
+                trade_data.get('justification', ''), # 🌟 新增
+                trade_data.get('invalidation_condition', '') # 🌟 新增
             ))
             self.conn.commit()
             logger.info(f"📝 交易记录已保存: {trade_data.get('symbol')}")
@@ -424,6 +433,27 @@ class AdvancedTradeDatabase:
         except Exception as e:
             logger.error(f"❌ 获取统计数据失败: {e}")
             return {}
+            
+    # 🌟 新增: 获取P&L历史用于夏普比率计算
+    def get_pnl_history(self, days=90) -> List[float]:
+        """获取历史P&L百分比列表"""
+        try:
+            cursor = self.conn.execute('''
+                SELECT pnl_percent 
+                FROM trades 
+                WHERE status = 'closed' 
+                AND pnl_percent IS NOT NULL
+                AND timestamp >= datetime('now', '-' || ? || ' days')
+                ORDER BY timestamp ASC
+            ''', (days,))
+            
+            rows = cursor.fetchall()
+            # 确保返回的是浮点数列表
+            return [float(row[0]) for row in rows if row[0] is not None]
+        except Exception as e:
+            logger.error(f"❌ 获取P&L历史失败: {e}")
+            return []
+
     
     def save_daily_stats(self, stats):
         """保存每日统计"""
@@ -443,7 +473,7 @@ class AdvancedTradeDatabase:
                 stats['total_pnl'],
                 stats['total_pnl_percent'],
                 stats.get('max_drawdown', 0),
-                stats.get('sharpe_ratio', 0),
+                stats.get('sharpe_ratio', 0), # 🌟 新增
                 stats.get('portfolio_value', 0)
             ))
             self.conn.commit()
@@ -537,6 +567,116 @@ def calculate_technical_indicators(df):
     except Exception as e:
         logger.error(f"❌ 技术指标计算失败: {e}")
         return df
+
+# ==================== 🌟 新增: 市场情绪分析器 ====================
+class MarketSentimentAnalyzer:
+    """获取资金费率 (Funding Rate) 和未平仓合约 (Open Interest)"""
+    
+    def __init__(self, exchange_instance):
+        self.exchange = exchange_instance
+        self.oi_cache = {}
+        self.funding_cache = {}
+        self.cache_ttl = 600  # 10分钟缓存
+
+    def get_funding_rate(self, symbol) -> float:
+        """获取资金费率"""
+        cache_key = symbol
+        now = time.time()
+        
+        if cache_key in self.funding_cache and (now - self.funding_cache[cache_key]['time']) < self.cache_ttl:
+            return self.funding_cache[cache_key]['rate']
+            
+        try:
+            funding_data = safe_api_call(self.exchange.fetch_funding_rate, symbol)
+            rate = float(funding_data.get('fundingRate', 0))
+            self.funding_cache[cache_key] = {'rate': rate, 'time': now}
+            return rate
+        except Exception as e:
+            logger.warning(f"⚠️ 获取{symbol}资金费率失败: {e}")
+            return 0.0
+
+    def get_open_interest(self, symbol) -> float:
+        """获取未平仓合约量 (USDT)"""
+        cache_key = symbol
+        now = time.time()
+
+        if cache_key in self.oi_cache and (now - self.oi_cache[cache_key]['time']) < self.cache_ttl:
+            return self.oi_cache[cache_key]['oi']
+
+        try:
+            # ccxt 标准 fetchOpenInterest 返回的是币本位，我们需要的是U本位
+            # OKX: fetch_open_interest U本位
+            oi_data = safe_api_call(self.exchange.fetch_open_interest, symbol)
+            # 'openInterestAmount' (币) 或 'openInterestValue' (USDT)
+            oi_value = float(oi_data.get('openInterestValue', 0)) 
+            if oi_value == 0:
+                 oi_value = float(oi_data.get('info', {}).get('oiCcy', 0)) # 兼容OKX
+
+            self.oi_cache[cache_key] = {'oi': oi_value, 'time': now}
+            return oi_value
+        except Exception as e:
+            logger.warning(f"⚠️ 获取{symbol}未平仓量失败: {e}")
+            return 0.0
+            
+    def get_comprehensive_sentiment(self, symbol, ohlcv_df: pd.DataFrame) -> Dict:
+        """
+        计算综合市场情绪
+        返回: {'composite_score': -100 to +100, 'funding_rate': ..., 'oi_value': ...}
+        """
+        try:
+            # 1. 资金费率 (Funding Rate) (权重 40%)
+            funding_rate = self.get_funding_rate(symbol)
+            funding_score = 0
+            if funding_rate > 0.0005:  # 费率很高 (看涨情绪过热)
+                funding_score = -40
+            elif funding_rate > 0.0001: # 费率偏高
+                funding_score = -15
+            elif funding_rate < -0.0005: # 费率很低 (看跌情绪过热)
+                funding_score = 40
+            elif funding_rate < -0.0001: # 费率偏低
+                funding_score = 15
+            
+            # 2. 未平仓合约 (Open Interest) (权重 30%)
+            oi_value = self.get_open_interest(symbol)
+            oi_score = 0
+            if not ohlcv_df.empty:
+                # 价格趋势
+                price_change = (ohlcv_df.iloc[-1]['close'] - ohlcv_df.iloc[-5]['close']) / ohlcv_df.iloc[-5]['close']
+                # OI趋势 (此处简化，真实应对比历史OI)
+                
+                if price_change > 0.01: # 价格上涨
+                    oi_score = 30 # 假设OI同步上涨
+                elif price_change < -0.01: # 价格下跌
+                    oi_score = -30 # 假设OI同步上涨
+
+            # 3. 价格动量 (RSI) (权重 30%)
+            rsi = ohlcv_df.iloc[-1].get('rsi_14', 50)
+            rsi_score = 0
+            if rsi > 70:
+                rsi_score = -30 # 超买
+            elif rsi > 60:
+                rsi_score = -15
+            elif rsi < 30:
+                rsi_score = 30 # 超卖
+            elif rsi < 40:
+                rsi_score = 15
+                
+            composite_score = np.clip(funding_score + oi_score + rsi_score, -100, 100)
+            
+            return {
+                'composite_score': composite_score,
+                'funding_rate': funding_rate,
+                'oi_value': oi_value,
+                'details': f"Funding: {funding_score}, OI: {oi_score}, RSI: {rsi_score}"
+            }
+        
+        except Exception as e:
+            logger.error(f"❌ 计算情绪分数失败: {e}")
+            return {'composite_score': 0, 'funding_rate': 0, 'oi_value': 0, 'details': 'Error'}
+
+
+# 全局情绪分析器实例
+sentiment_analyzer = MarketSentimentAnalyzer(exchange)
 
 # ==================== 📈 多策略决策引擎 ====================
 class MultiStrategyEngine:
@@ -779,6 +919,14 @@ class MultiStrategyEngine:
             logger.error(f"❌ 突破策略分析失败: {e}")
             return {'score': 50, 'confidence': 0.3, 'signals': [], 'direction': 'neutral'}
     
+    # 🌟 新增: 市场情绪评分
+    def get_market_sentiment_score(self, symbol, df):
+        """获取市场情绪评分"""
+        global sentiment_analyzer
+        sentiment = sentiment_analyzer.get_comprehensive_sentiment(symbol, df)
+        logger.info(f"🌀 {symbol} 情绪分析: {sentiment['composite_score']:.0f} ({sentiment['details']})")
+        return sentiment['composite_score'], sentiment # 返回分数和完整数据
+    
     def analyze_symbol(self, symbol, timeframe_data):
         """综合分析币种"""
         try:
@@ -786,6 +934,14 @@ class MultiStrategyEngine:
             total_score = 0
             total_confidence = 0
             total_weight = 0
+            
+            # 🌟 新增: 融合市场情绪
+            # 使用15m数据计算情绪
+            sentiment_df = timeframe_data.get('15m', {}).get('df', pd.DataFrame())
+            if sentiment_df.empty:
+                sentiment_df = timeframe_data.get('5m', {}).get('df', pd.DataFrame())
+                
+            sentiment_score, sentiment_data = self.get_market_sentiment_score(symbol, sentiment_df)
             
             for strategy_name, strategy_config in self.strategies.items():
                 if not strategy_config['enabled']:
@@ -820,21 +976,26 @@ class MultiStrategyEngine:
                 total_weight += weight
             
             if total_weight == 0:
-                return {'final_score': 0, 'final_confidence': 0, 'strategies': {}}
-            
-            final_score = total_score / total_weight
-            final_confidence = total_confidence / total_weight
+                final_score = 0
+                final_confidence = 0
+            else:
+                final_score = total_score / total_weight
+                final_confidence = total_confidence / total_weight
+
+            # 🌟 新增: 融合情绪评分 (给予20%权重)
+            final_score_with_sentiment = (final_score * 0.8) + ( (sentiment_score + 100) / 2 * 0.2) # 情绪评分-100~100 -> 0~100
             
             return {
-                'final_score': final_score,
+                'final_score': final_score_with_sentiment, # 使用融合后分数
                 'final_confidence': final_confidence,
                 'strategies': strategy_results,
-                'recommended_direction': self._get_recommended_direction(strategy_results)
+                'recommended_direction': self._get_recommended_direction(strategy_results),
+                'sentiment_data': sentiment_data # 传递情绪数据
             }
             
         except Exception as e:
             logger.error(f"❌ 币种分析失败 {symbol}: {e}")
-            return {'final_score': 0, 'final_confidence': 0, 'strategies': {}}
+            return {'final_score': 0, 'final_confidence': 0, 'strategies': {}, 'sentiment_data': None}
     
     def _get_recommended_direction(self, strategy_results):
         """根据策略结果推荐方向"""
@@ -878,7 +1039,8 @@ class DeepSeekDecisionEngine:
                         "content": """你是一位急需数十万美元资金为女友治疗癌症的专业的量化交易员，擅长周期趋势分析加密货币合约交易。
                         请基于K线形态技术分析和市场数据给出理性的交易决策。
                         严格遵守风险管理和资金管理原则。
-                        只在高胜率机会时才建议交易。"""
+                        只在高胜率机会时才建议交易。
+                        你的决策必须以 `json prompt.md` 中定义的严格JSON格式返回。"""
                     },
                     {
                         "role": "user",
@@ -886,17 +1048,22 @@ class DeepSeekDecisionEngine:
                     }
                 ],
                 temperature=0.1,
-                max_tokens=1000
+                max_tokens=1500 # 增加token以容纳更复杂的prompt
             )
             
-            return self._parse_ai_response(response.choices[0].message.content, market_data, strategy_analysis)
+            # V2.1: 打印AI原始回复
+            response_text = response.choices[0].message.content
+            logger.info(f"🤖 AI原始回复: {response_text}")
+            
+            return self._parse_ai_response(response_text, market_data, strategy_analysis)
             
         except Exception as e:
             logger.error(f"❌ AI决策失败: {e}")
             return self._create_fallback_signal(market_data, strategy_analysis)
     
+    # 🌟 修改: 更新AI Prompt
     def _build_ai_prompt(self, symbol, market_data, strategy_analysis):
-        """构建AI提示词"""
+        """构建AI提示词 (V2 - 融合情绪和新JSON格式)"""
         current_price = market_data['current_price']
         tf_data = list(market_data['timeframes'].values())[0]
         current = tf_data['current']
@@ -908,8 +1075,16 @@ class DeepSeekDecisionEngine:
 🚀 AI决策主导模式已启用:
 - 您拥有最终决策权，策略分析仅供参考
 - 请基于全面的市场分析做出独立判断
-- 可以覆盖策略引擎的建议信号
 - 重点关注风险回报比和资金安全
+"""
+        
+        # 🌟 新增: 市场情绪文本
+        sentiment_data = strategy_analysis.get('sentiment_data', {})
+        sentiment_text = f"""
+🌀 市场情绪分析 (综合评分: {sentiment_data.get('composite_score', 0):.0f} / 100):
+- 资金费率: {sentiment_data.get('funding_rate', 0) * 100:.4f}%
+- 未平仓合约: ${sentiment_data.get('oi_value', 0):,.0f}
+- 情绪详情: {sentiment_data.get('details', 'N/A')}
 """
         
         prompt = f"""
@@ -922,18 +1097,19 @@ class DeepSeekDecisionEngine:
 - 24小时波动率: {current.get('atr_percent', 0)*100:.2f}%
 - 成交量比率: {current.get('volume_ratio', 1):.2f}
 
+{sentiment_text}
+
 🎯 多策略综合分析：
-- 综合评分: {strategy_analysis.get('final_score', 0):.1f}/100
+- 综合评分 (含情绪): {strategy_analysis.get('final_score', 0):.1f}/100
 - 综合信心度: {strategy_analysis.get('final_confidence', 0):.1%}
 - 推荐方向: {strategy_analysis.get('recommended_direction', 'neutral')}
 
 策略详情:
 {json.dumps(strategy_analysis.get('strategies', {}), indent=2, ensure_ascii=False)}
 
-📈 技术指标状态：
+📈 技术指标状态 (15m):
 - RSI(14): {current.get('rsi_14', 50):.1f}
-- MACD: {current.get('macd', 0):.4f}
-- MACD信号: {current.get('macd_signal', 0):.4f}
+- MACD: {current.get('macd', 0):.4f} (Signal: {current.get('macd_signal', 0):.4f})
 - ADX: {current.get('adx', 0):.1f}
 - ATR: {current.get('atr', 0):.4f} ({current.get('atr_percent', 0)*100:.2f}%)
 - 布林带位置: {current.get('bb_position', 0.5):.2%}
@@ -942,44 +1118,42 @@ class DeepSeekDecisionEngine:
 
 💰 账户状态：
 - 今日盈亏: {trading_state.daily_pnl:+.2%}
-- 今日交易: {trading_state.trade_count}笔
-- 胜率: {trading_state.get_win_rate():.1f}%
+- 夏普比率: {trading_state.sharpe_ratio:.2f}
 - 连续亏损: {trading_state.consecutive_losses}次
 - 当前持仓数: {len(trading_state.positions)}
 
 ⚠️ 风险控制要求：
-- 单笔最大风险: {TRADE_CONFIG['risk_management']['max_single_loss']:.1%}
 - 风险回报比要求: ≥{TRADE_CONFIG['risk_management']['risk_reward_ratio']}:1
 - 最低信心度: {TRADE_CONFIG['ai_decision_mode']['min_confidence']:.2f}
-- 杠杆范围: {TRADE_CONFIG['leverage']['base_leverage']}-{TRADE_CONFIG['leverage']['max_leverage']}x
+- 夏普比率低 (<1.0) 时请降低仓位和信心度。
 
-请以JSON格式输出交易决策，包含以下字段：
+请严格按照以下JSON格式输出交易决策 (参考 json prompt.md)：
 {{
     "signal": "BUY|SELL|HOLD",
+    "coin": "{symbol}",
     "confidence": 0.00-1.00,
     "entry_price": {current_price},
-    "stop_loss": 具体价格,
-    "take_profit": 具体价格,
+    "stop_loss": "具体价格",
+    "take_profit": "具体价格",
     "leverage": {TRADE_CONFIG['leverage']['base_leverage']}-{TRADE_CONFIG['leverage']['max_leverage']}整数,
     "position_size_percent": 0.05-0.25,
-    "reason": "详细分析理由(100字以内)",
-    "expected_risk_reward": 具体数值,
-    "time_horizon": "SHORT|MEDIUM|LONG",
-    "key_levels": {{"support": 价格, "resistance": 价格}}
+    "reason": "简明扼要的交易理由 (50字以内)",
+    "justification": "详细分析逻辑，包括对技术面和情绪面的考量 (200字以内)",
+    "invalidation_condition": "基于技术指标的平仓条件 (例如: 'RSI<30' 或 'price<EMA50')",
+    "expected_risk_reward": "具体数值",
+    "time_horizon": "SHORT|MEDIUM|LONG"
 }}
 
 决策原则：
-1. 只在信心度>{TRADE_CONFIG['ai_decision_mode']['min_confidence']}时才建议BUY/SELL
-2. 基于技术分析建议合理的止损止盈价位，确保风险回报比≥{TRADE_CONFIG['risk_management']['risk_reward_ratio']}:1
-3. 考虑当前账户状态，连续亏损时降低仓位
-4. 高波动环境降低杠杆，低波动适当提高
-5. 必须给出明确的入场、止损、止盈价格
-6. 简要分析理由（考虑趋势连续性、支撑阻力、成交量等因素）
+1. 只在信心度>{TRADE_CONFIG['ai_decision_mode']['min_confidence']}时才建议BUY/SELL。
+2. 市场情绪与技术分析背离时，降低信心度或HOLD。
+3. 必须提供明确的 `invalidation_condition` 作为条件止损。
 """
         return prompt
     
+    # 🌟 修改: 解析新的JSON字段
     def _parse_ai_response(self, response_text, market_data, strategy_analysis):
-        """解析AI响应"""
+        """解析AI响应 (V2)"""
         try:
             # 提取JSON部分
             start_idx = response_text.find('{')
@@ -992,14 +1166,14 @@ class DeepSeekDecisionEngine:
             signal_data = json.loads(json_str)
             
             # 验证必需字段
-            required_fields = ['signal', 'confidence', 'reason']
+            required_fields = ['signal', 'confidence', 'reason', 'justification', 'invalidation_condition', 'coin']
             if not all(field in signal_data for field in required_fields):
+                logger.warning(f"AI响应缺少必需字段: {response_text}")
                 raise ValueError("AI响应缺少必需字段")
             
             # 🚀 AI决策模式：覆盖策略分析结果
             if TRADE_CONFIG['ai_decision_mode']['override_strategy']:
                 logger.info("🚀 AI决策模式：覆盖策略分析结果")
-                # AI信号覆盖策略推荐方向
             
             # 设置默认值
             tf_data = list(market_data['timeframes'].values())[0]
@@ -1012,7 +1186,7 @@ class DeepSeekDecisionEngine:
             signal_data.setdefault('time_horizon', 'MEDIUM')
             
             # 计算止损止盈（如果未提供）
-            if 'stop_loss' not in signal_data or 'take_profit' not in signal_data:
+            if 'stop_loss' not in signal_data or 'take_profit' not in signal_data or not isinstance(signal_data['stop_loss'], (int, float)):
                 stop_tp = self._calculate_stop_take_profit(
                     signal_data['entry_price'],
                     signal_data['signal'],
@@ -1027,7 +1201,7 @@ class DeepSeekDecisionEngine:
             return signal_data
             
         except Exception as e:
-            logger.warning(f"⚠️ AI响应解析失败: {e}")
+            logger.warning(f"⚠️ AI响应解析失败: {e}. 原始文本: {response_text}")
             return self._create_fallback_signal(market_data, strategy_analysis)
     
     def _calculate_stop_take_profit(self, entry_price, signal, atr):
@@ -1035,6 +1209,9 @@ class DeepSeekDecisionEngine:
         sl_multiple = TRADE_CONFIG['risk_management']['stop_loss_atr_multiple']
         tp_multiple = TRADE_CONFIG['risk_management']['take_profit_atr_multiple']
         
+        if atr is None or atr == 0:
+            atr = entry_price * 0.01 # 备用ATR
+            
         if signal == 'BUY':
             stop_loss = entry_price - atr * sl_multiple
             take_profit = entry_price + atr * tp_multiple
@@ -1069,11 +1246,12 @@ class DeepSeekDecisionEngine:
         stop_tp = self._calculate_stop_take_profit(
             market_data['current_price'],
             signal,
-            current['atr']
+            current.get('atr', market_data['current_price'] * 0.01)
         )
         
         return {
             "signal": signal,
+            "coin": market_data.get('symbol', 'N/A'),
             "confidence": confidence,
             "entry_price": market_data['current_price'],
             "stop_loss": stop_tp['stop_loss'],
@@ -1081,6 +1259,8 @@ class DeepSeekDecisionEngine:
             "leverage": 8,
             "position_size_percent": 0.08,
             "reason": f"备用信号: 策略评分{score:.1f}, 方向{direction}",
+            "justification": "AI决策引擎失败，切换至基于策略分数的备用信号。",
+            "invalidation_condition": "price<SMA50" if signal == "BUY" else "price>SMA50",
             "expected_risk_reward": 2.5,
             "time_horizon": "MEDIUM",
             "is_fallback": True,
@@ -1097,8 +1277,9 @@ class PortfolioManager:
         self.max_single_position = TRADE_CONFIG['risk_management']['max_single_position']
         self.max_open_positions = TRADE_CONFIG['risk_management']['max_open_positions']
     
+    # 🌟 修改: 融合夏普比率
     def calculate_position_size(self, symbol, signal_data, available_balance):
-        """计算仓位大小"""
+        """计算仓位大小 (V2 - 融合夏普比率)"""
         try:
             # 基础仓位大小
             base_position_percent = signal_data['position_size_percent']
@@ -1114,8 +1295,19 @@ class PortfolioManager:
             score_factor = signal_data.get('strategy_score', 50) / 100
             score_factor = max(0.5, min(1.0, score_factor))
             
+            # 🌟 新增: 根据夏普比率调整
+            sharpe_ratio = trading_state.sharpe_ratio
+            if sharpe_ratio < 0:
+                sharpe_factor = 0.5  # 亏损期减半
+            elif sharpe_ratio < 1:
+                sharpe_factor = 0.75 # 表现一般
+            elif sharpe_ratio > 2:
+                sharpe_factor = 1.2  # 高效期可增加
+            else:
+                sharpe_factor = 1.0
+            
             # 计算最终仓位比例
-            position_percent = base_position_percent * confidence_factor * loss_penalty * score_factor
+            position_percent = base_position_percent * confidence_factor * loss_penalty * score_factor * sharpe_factor
             
             # 应用单币种限制
             position_percent = min(position_percent, self.max_single_position)
@@ -1136,7 +1328,7 @@ class PortfolioManager:
             quantity = (position_value * leverage) / signal_data['entry_price']
             
             logger.info(f"💼 仓位计算: {position_percent:.2%} × {leverage}x = {quantity:.6f} {symbol}")
-            logger.info(f"   因子: 信心{confidence_factor:.2f} × 亏损{loss_penalty:.2f} × 评分{score_factor:.2f}")
+            logger.info(f"   因子: 信心{confidence_factor:.2f} × 亏损{loss_penalty:.2f} × 评分{score_factor:.2f} × 夏普{sharpe_factor:.2f}")
             
             return quantity
             
@@ -1238,7 +1430,7 @@ class MarketDataProvider:
         self.cache_ttl = 300  # 缓存5分钟
     
     def get_multi_timeframe_data(self, symbol, timeframes=None):
-        """获取多时间框架数据"""
+        """获取多时间框架数据 (V2 - 增加情绪数据)"""
         if timeframes is None:
             timeframes = ['1h', '15m', '5m', '4h']
         
@@ -1247,8 +1439,11 @@ class MarketDataProvider:
                 'symbol': symbol,
                 'timestamp': datetime.now(),
                 'timeframes': {},
-                'current_price': 0
+                'current_price': 0,
+                'sentiment_data': {} # 🌟 新增
             }
+            
+            sentiment_df = pd.DataFrame() # 用于情绪分析的DF
             
             for tf in timeframes:
                 try:
@@ -1257,6 +1452,7 @@ class MarketDataProvider:
                     if (cache_key in self.cache and 
                         (datetime.now() - self.cache[cache_key]['timestamp']).seconds < self.cache_ttl):
                         tf_data = self.cache[cache_key]['data']
+                        df = tf_data['df']
                     else:
                         # 获取K线数据
                         ohlcv = safe_api_call(
@@ -1292,6 +1488,9 @@ class MarketDataProvider:
                     result['timeframes'][tf] = tf_data
                     result['current_price'] = tf_data['current']['close']
                     
+                    if tf == '15m':
+                        sentiment_df = df # 优先使用15m数据进行情绪分析
+                    
                     time.sleep(0.1)  # 避免API限流
                     
                 except Exception as e:
@@ -1300,7 +1499,17 @@ class MarketDataProvider:
             
             if not result['timeframes']:
                 return None
+            
+            # 🌟 新增: 获取情绪数据
+            if sentiment_df.empty and '5m' in result['timeframes']:
+                sentiment_df = result['timeframes']['5m']['df'] # 备用5m
                 
+            if not sentiment_df.empty:
+                result['sentiment_data'] = sentiment_analyzer.get_comprehensive_sentiment(symbol, sentiment_df)
+            else:
+                result['sentiment_data'] = sentiment_analyzer.get_comprehensive_sentiment(symbol, pd.DataFrame())
+
+
             return result
             
         except Exception as e:
@@ -1339,13 +1548,11 @@ class TradingExecutor:
             # 动态调整杠杆
             signal_data['leverage'] = self.portfolio_mgr.calculate_dynamic_leverage(signal_data, market_data)
             
-            # 使用小资金优化器计算仓位
-            position_value = available_balance * signal_data['position_size_percent']
-            quantity = small_capital_optimizer.calculate_optimal_quantity(
+            # 🌟 修改: 使用夏普比率调整仓位
+            quantity = self.portfolio_mgr.calculate_position_size(
                 symbol,
-                signal_data['entry_price'],
-                position_value,
-                signal_data['leverage']
+                signal_data,
+                available_balance
             )
             
             if quantity <= 0:
@@ -1440,42 +1647,9 @@ class TradingExecutor:
         
         return True
     
+    # 🌟 修改: 增加新字段
     def _log_simulated_trade(self, symbol, signal_data, quantity):
-        """记录模拟交易"""
-        trade_record = {
-            'symbol': symbol,
-            'strategy': 'deepseek_ai',
-            'side': signal_data['signal'],
-            'entry_price': signal_data['entry_price'],
-            'quantity': quantity,
-            'leverage': signal_data['leverage'],
-            'confidence': signal_data['confidence'],
-            'stop_loss': signal_data['stop_loss'],
-            'take_profit': signal_data['take_profit'],
-            'risk_reward_ratio': signal_data.get('expected_risk_reward', 2.5),
-            'market_condition': signal_data.get('time_horizon', 'MEDIUM'),
-            'status': 'open'
-        }
-        
-        db.log_trade(trade_record)
-        trading_state.daily_trades.append(trade_record)
-        
-        message = f"""
-🎯 模拟交易执行:
-🪙 币种: {symbol}
-📈 方向: {signal_data['signal']}
-💵 价格: ${signal_data['entry_price']:.4f}
-📦 数量: {quantity:.6f}
-⚡ 杠杆: {signal_data['leverage']}x
-💪 信心度: {signal_data['confidence']:.1%}
-🛑 止损: ${signal_data['stop_loss']:.4f} ({((signal_data['stop_loss']/signal_data['entry_price']-1)*100):+.2f}%)
-🎯 止盈: ${signal_data['take_profit']:.4f} ({((signal_data['take_profit']/signal_data['entry_price']-1)*100):+.2f}%)
-📝 理由: {signal_data['reason']}
-        """
-        logger.info(message)
-    
-    def _log_trade_execution(self, symbol, signal_data, quantity, order):
-        """记录交易执行"""
+        """记录模拟交易 (V2)"""
         trade_record = {
             'symbol': symbol,
             'strategy': 'deepseek_ai',
@@ -1489,7 +1663,47 @@ class TradingExecutor:
             'risk_reward_ratio': signal_data.get('expected_risk_reward', 2.5),
             'market_condition': signal_data.get('time_horizon', 'MEDIUM'),
             'status': 'open',
-            'order_id': order.get('id', '')
+            'justification': signal_data.get('justification', ''),
+            'invalidation_condition': signal_data.get('invalidation_condition', '')
+        }
+        
+        db.log_trade(trade_record)
+        trading_state.daily_trades.append(trade_record)
+        
+        message = f"""
+🎯 模拟交易执行:
+🪙 币种: {symbol}
+📈 方向: {signal_data['signal']}
+💵 价格: ${signal_data['entry_price']:.4f}
+📦 数量: {quantity:.6f}
+⚡ 杠杆: {signal_data['leverage']}x
+💪 信心度: {signal_data['confidence']:.1%}
+🛑 止损: ${signal_data['stop_loss']:.4f}
+🎯 止盈: ${signal_data['take_profit']:.4f}
+🛡️ 条件止损: {signal_data.get('invalidation_condition', 'N/A')}
+📝 理由: {signal_data['reason']}
+        """
+        logger.info(message)
+    
+    # 🌟 修改: 增加新字段
+    def _log_trade_execution(self, symbol, signal_data, quantity, order):
+        """记录交易执行 (V2)"""
+        trade_record = {
+            'symbol': symbol,
+            'strategy': 'deepseek_ai',
+            'side': signal_data['signal'],
+            'entry_price': signal_data['entry_price'],
+            'quantity': quantity,
+            'leverage': signal_data['leverage'],
+            'confidence': signal_data['confidence'],
+            'stop_loss': signal_data['stop_loss'],
+            'take_profit': signal_data['take_profit'],
+            'risk_reward_ratio': signal_data.get('expected_risk_reward', 2.5),
+            'market_condition': signal_data.get('time_horizon', 'MEDIUM'),
+            'status': 'open',
+            'order_id': order.get('id', ''),
+            'justification': signal_data.get('justification', ''),
+            'invalidation_condition': signal_data.get('invalidation_condition', '')
         }
         
         db.log_trade(trade_record)
@@ -1504,7 +1718,8 @@ class TradingExecutor:
             'leverage': signal_data['leverage'],
             'stop_loss': signal_data['stop_loss'],
             'take_profit': signal_data['take_profit'],
-            'entry_time': datetime.now()
+            'entry_time': datetime.now(),
+            'invalidation_condition': signal_data.get('invalidation_condition', '') # 🌟 新增
         }
         
         message = f"""
@@ -1517,6 +1732,7 @@ class TradingExecutor:
 💪 信心度: {signal_data['confidence']:.1%}
 🛑 止损: ${signal_data['stop_loss']:.4f}
 🎯 止盈: ${signal_data['take_profit']:.4f}
+🛡️ 条件止损: {signal_data.get('invalidation_condition', 'N/A')}
 📝 理由: {signal_data['reason']}
 🆔 订单ID: {order.get('id', 'N/A')}
         """
@@ -1560,16 +1776,75 @@ class TradingExecutor:
                 
         except Exception as e:
             logger.warning(f"⚠️ 设置止损止盈失败: {e}")
+            
+    # 🌟 新增: 外部调用的平仓函数
+    def close_position(self, symbol: str, reason: str = "External Close"):
+        """
+        公开的平仓方法，用于从 PositionMonitor 调用
+        """
+        if TRADE_CONFIG['test_mode']:
+            logger.info(f"🧪 测试模式 - 模拟平仓 {symbol}: {reason}")
+            # 模拟平仓
+            if symbol in trading_state.positions:
+                pos = trading_state.positions[symbol]
+                # 模拟 PNL (简单假设)
+                pnl = (pos.get('current_price', pos['entry_price']) - pos['entry_price']) * pos['quantity']
+                if pos['side'] == 'SELL':
+                    pnl = -pnl
+                
+                exit_data = {
+                    'exit_price': pos.get('current_price', pos['entry_price']),
+                    'pnl': pnl,
+                    'pnl_percent': pnl / (pos['entry_price'] * pos['quantity'] / pos['leverage']) if pos['entry_price'] > 0 else 0,
+                    'exit_reason': reason,
+                    'duration_seconds': (datetime.now() - pos.get('entry_time', datetime.now())).seconds
+                }
+                db.update_trade_exit(symbol, exit_data)
+                del trading_state.positions[symbol]
+                logger.info(f"✅ 模拟平仓 {symbol} 完成")
+            return
+
+        try:
+            position = safe_api_call(exchange.fetch_position, symbol)
+            if not position or float(position.get('contracts', 0)) == 0:
+                logger.info(f"ℹ️ {symbol} 无需平仓 (已无持仓)")
+                if symbol in trading_state.positions:
+                    del trading_state.positions[symbol] # 清理状态
+                return
+
+            side = 'buy' if position.get('side') == 'short' else 'sell'
+            quantity = float(position.get('contracts', 0))
+
+            order = safe_api_call(
+                exchange.create_market_order,
+                symbol,
+                side,
+                quantity,
+                params={'reduceOnly': True}
+            )
+
+            if order:
+                logger.info(f"✅ {symbol} 成功平仓: {reason}")
+                # 记录平仓到数据库 (PositionMonitor 会在下次同步时处理)
+            else:
+                logger.error(f"❌ {symbol} 平仓订单失败")
+
+        except Exception as e:
+            logger.error(f"❌ {symbol} 平仓执行失败: {e}")
+            traceback.print_exc()
+
 
 # ==================== 🔄 持仓监控管理器 ====================
 class PositionMonitor:
-    """持仓监控管理器"""
+    """持仓监控管理器 (V2 - 集成条件止损)"""
     
-    def __init__(self):
+    def __init__(self, market_data_provider: MarketDataProvider, trading_executor: TradingExecutor):
         self.alert_thresholds = {
             'profit': TRADE_CONFIG['monitoring']['profit_alert'],
             'loss': TRADE_CONFIG['monitoring']['loss_alert']
         }
+        self.market_data_provider = market_data_provider
+        self.trading_executor = trading_executor
     
     def monitor_all_positions(self):
         """监控所有持仓"""
@@ -1579,6 +1854,8 @@ class PositionMonitor:
             
             positions = safe_api_call(exchange.fetch_positions)
             if not positions:
+                # 如果API返回空列表，表示没有持仓，需要清理本地状态
+                self._clear_stale_positions([])
                 return
             
             active_positions = []
@@ -1595,16 +1872,17 @@ class PositionMonitor:
                         )
             
             # 清理不存在的持仓
-            for symbol in list(trading_state.positions.keys()):
-                if symbol not in active_positions:
-                    self._close_position_record(symbol)
+            self._clear_stale_positions(active_positions)
             
+            # 🌟 新增: 检查条件止损
+            self._check_invalidation_conditions()
+
             # 更新交易状态
             self._update_trading_state()
             
         except Exception as e:
             logger.error(f"❌ 监控持仓失败: {e}")
-    
+            
     def _analyze_position(self, position):
         """分析单个持仓"""
         try:
@@ -1617,29 +1895,32 @@ class PositionMonitor:
             if entry_price == 0:
                 return
             
-            # 计算盈亏百分比
-            pnl_percent = unrealized_pnl / (entry_price * quantity) if (entry_price * quantity) > 0 else 0
+            # 计算盈亏百分比 (基于保证金)
+            margin = float(position.get('initialMargin', (entry_price * quantity) / float(position.get('leverage', 1))))
+            pnl_percent = unrealized_pnl / margin if margin > 0 else 0
             
             # 更新持仓信息
-            if symbol in trading_state.positions:
-                trading_state.positions[symbol].update({
-                    'current_price': current_price,
-                    'unrealized_pnl': unrealized_pnl,
-                    'pnl_percent': pnl_percent,
-                    'liquidation_price': float(position.get('liquidationPrice', 0))
-                })
-            else:
+            if symbol not in trading_state.positions:
+                 # 如果状态丢失，从交易所恢复
                 trading_state.positions[symbol] = {
                     'symbol': symbol,
-                    'side': position.get('side', 'long'),
+                    'side': 'BUY' if position.get('side') == 'long' else 'SELL',
                     'quantity': quantity,
                     'entry_price': entry_price,
-                    'current_price': current_price,
-                    'unrealized_pnl': unrealized_pnl,
-                    'pnl_percent': pnl_percent,
                     'leverage': float(position.get('leverage', 1)),
-                    'liquidation_price': float(position.get('liquidationPrice', 0))
+                    'entry_time': datetime.now() - timedelta(minutes=10), # 估算时间
+                    'stop_loss': 0, # 无法恢复
+                    'take_profit': 0, # 无法恢复
+                    'invalidation_condition': 'N/A' # 无法从交易所恢复
                 }
+
+            # 更新实时数据
+            trading_state.positions[symbol].update({
+                'current_price': current_price,
+                'unrealized_pnl': unrealized_pnl,
+                'pnl_percent': pnl_percent,
+                'liquidation_price': float(position.get('liquidationPrice', 0))
+            })
             
             # 发送告警
             self._send_alerts(symbol, pnl_percent, unrealized_pnl)
@@ -1648,7 +1929,98 @@ class PositionMonitor:
             
         except Exception as e:
             logger.error(f"❌ 分析持仓失败: {e}")
+            
+    # 🌟 修改: 清理本地状态
+    def _clear_stale_positions(self, active_symbols: List[str]):
+        """清理本地状态中已平仓的持仓"""
+        local_symbols = list(trading_state.positions.keys())
+        for symbol in local_symbols:
+            if symbol not in active_symbols:
+                logger.info(f"🔄 {symbol} 持仓已关闭 (交易所数据同步)")
+                self._close_position_record(symbol)
+
     
+    # 🌟 新增: 条件止损检查
+    def _check_invalidation_conditions(self):
+        """检查所有持仓的条件止损"""
+        logger.info("🛡️ 检查条件止损...")
+        symbols_to_close = []
+
+        for symbol, pos_data in trading_state.positions.items():
+            condition = pos_data.get('invalidation_condition')
+            if not condition or condition == 'N/A':
+                continue
+            
+            try:
+                # 获取最新的市场数据
+                market_data = self.market_data_provider.get_multi_timeframe_data(symbol, timeframes=['15m', '5m'])
+                if not market_data:
+                    logger.warning(f"⚠️ 无法获取{symbol}数据以检查条件止损")
+                    continue
+                
+                # 评估条件
+                if self._evaluate_condition(symbol, condition, market_data):
+                    logger.warning(f"🚨 {symbol} 触发条件止损: {condition}!")
+                    symbols_to_close.append(symbol)
+                    
+            except Exception as e:
+                logger.error(f"❌ 检查{symbol}条件止损失败: {e}")
+        
+        # 执行平仓
+        for symbol in symbols_to_close:
+            self.trading_executor.close_position(symbol, f"条件止损触发: {trading_state.positions[symbol].get('invalidation_condition')}")
+
+    # 🌟 新增: 条件评估器
+    def _evaluate_condition(self, symbol: str, condition: str, market_data: Dict) -> bool:
+        """评估条件止损字符串 (简化版)"""
+        try:
+            # 优先使用15m数据，备用5m
+            data = market_data['timeframes'].get('15m', {}).get('current')
+            if not data:
+                data = market_data['timeframes'].get('5m', {}).get('current')
+            if not data:
+                return False
+
+            price = data.get('close', 0)
+            
+            # 支持多个 "或" 条件
+            for cond in condition.split('或'):
+                cond = cond.strip()
+                
+                # 匹配: RSI<30, price>EMA50 等
+                match = re.match(r'(RSI|price|MACD_HIST)\s*([<>])\s*(\d+|EMA50|EMA20)', cond, re.IGNORECASE)
+                
+                if match:
+                    metric, operator, value = match.groups()
+                    metric_val = 0
+                    
+                    if metric.upper() == 'RSI':
+                        metric_val = data.get('rsi_14', 50)
+                    elif metric.upper() == 'PRICE':
+                        metric_val = price
+                    elif metric.upper() == 'MACD_HIST':
+                        metric_val = data.get('macd_histogram', 0)
+                    
+                    target_val = 0
+                    if value.upper() == 'EMA50':
+                        target_val = data.get('ema_50', price)
+                    elif value.upper() == 'EMA20':
+                        target_val = data.get('ema_20', price)
+                    else:
+                        target_val = float(value)
+                    
+                    # 评估
+                    if operator == '<' and metric_val < target_val:
+                        return True
+                    if operator == '>' and metric_val > target_val:
+                        return True
+            
+            return False # 未触发
+            
+        except Exception as e:
+            logger.error(f"❌ 评估条件失败 '{condition}': {e}")
+            return False
+
     def _close_position_record(self, symbol):
         """关闭持仓记录"""
         try:
@@ -1716,14 +2088,43 @@ class PositionMonitor:
 
 # ==================== 📈 性能分析器 ====================
 class PerformanceAnalyzer:
-    """性能分析器"""
+    """性能分析器 (V2 - 集成夏普比率)"""
     
     def __init__(self):
         self.start_time = datetime.now()
     
+    # 🌟 新增: 夏普比率计算
+    def _calculate_sharpe_ratio(self, days=90, risk_free_rate=0.0) -> float:
+        """计算历史夏普比率"""
+        try:
+            pnl_history = db.get_pnl_history(days=days)
+            if len(pnl_history) < 10: # 需要足够数据
+                return 0.0
+                
+            returns = np.array(pnl_history)
+            excess_returns = returns - (risk_free_rate / 365) # 假设pnl是日收益
+            
+            if np.std(excess_returns) == 0:
+                return 0.0
+                
+            # 计算夏普比率 (假设pnl_history是每次交易的收益率)
+            sharpe_ratio = np.mean(excess_returns) / np.std(excess_returns)
+            
+            # 年化 (假设日均交易N次)
+            # 简化处理，不进行年化，直接使用比率
+            
+            return sharpe_ratio
+
+        except Exception as e:
+            logger.error(f"❌ 计算夏普比率失败: {e}")
+            return 0.0
+
     def print_realtime_stats(self):
         """实时输出统计信息"""
         try:
+            # 🌟 新增: 更新夏普比率
+            trading_state.sharpe_ratio = self._calculate_sharpe_ratio()
+            
             stats = trading_state.get_daily_summary()
             hist_stats = db.get_statistics(days=7)
             
@@ -1737,6 +2138,7 @@ class PerformanceAnalyzer:
             if trading_state.initial_balance > 0:
                 total_return = (trading_state.portfolio_value - trading_state.initial_balance) / trading_state.initial_balance * 100
                 print(f"  总回报率: {total_return:+.2f}%")
+            print(f"  夏普比率 (90d): {trading_state.sharpe_ratio:.2f}") # 🌟 新增
             
             print(f"\n📈 今日表现:")
             print(f"  交易次数: {stats['trades']}笔")
@@ -1765,6 +2167,7 @@ class PerformanceAnalyzer:
                     print(f"    当前: ${pos.get('current_price', 0):.4f}")
                     print(f"    盈亏: {pos.get('pnl_percent', 0):+.2%} (${pos.get('unrealized_pnl', 0):+.2f})")
                     print(f"    杠杆: {pos.get('leverage', 0)}x")
+                    print(f"    条件止损: {pos.get('invalidation_condition', 'N/A')}") # 🌟 新增
             
             print("="*70 + "\n")
             
@@ -1780,7 +2183,8 @@ class PerformanceAnalyzer:
                 'win_rate': stats['win_rate'],
                 'total_pnl': stats['daily_pnl'] * trading_state.initial_balance,
                 'total_pnl_percent': stats['daily_pnl_percent'],
-                'portfolio_value': trading_state.portfolio_value
+                'portfolio_value': trading_state.portfolio_value,
+                'sharpe_ratio': trading_state.sharpe_ratio # 🌟 新增
             }
             db.save_daily_stats(daily_stats)
             
@@ -1790,6 +2194,9 @@ class PerformanceAnalyzer:
     def generate_daily_report(self):
         """生成日报"""
         try:
+            # 确保夏普比率是最新
+            trading_state.sharpe_ratio = self._calculate_sharpe_ratio()
+            
             stats = trading_state.get_daily_summary()
             hist_stats = db.get_statistics(days=30)
             
@@ -1817,6 +2224,7 @@ class PerformanceAnalyzer:
 • 投资组合价值: ${trading_state.portfolio_value:.2f}
 • 初始余额: ${trading_state.initial_balance:.2f}
 • 总回报率: {((trading_state.portfolio_value / trading_state.initial_balance - 1) * 100) if trading_state.initial_balance > 0 else 0:.2f}%
+• 夏普比率 (90d): {trading_state.sharpe_ratio:.2f}
 
 🚀 运行信息:
 • 运行时长: {(datetime.now() - self.start_time).days}天
@@ -1960,8 +2368,8 @@ class SmallCapitalPositionOptimizer:
     """小资金仓位优化器 - 支持100U操作不同价格币种"""
     
     def __init__(self):
-        self.min_position_value = 5  # 最小开仓价值5 USDT
-        self.max_position_value = 1000  # 最大单笔1000 USDT
+        self.min_position_value = 2  # 最小开仓价值2 USDT
+        self.max_position_value = 5000  # 最大单笔5000 USDT
     
     def calculate_optimal_quantity(self, symbol, entry_price, position_value, leverage):
         """计算最优数量 - 适配不同价格币种"""
@@ -2073,7 +2481,8 @@ class DeepSeekTradingBot:
         self.strategy_engine = MultiStrategyEngine()
         self.ai_engine = DeepSeekDecisionEngine(deepseek_client)
         self.trading_executor = TradingExecutor()
-        self.position_monitor = PositionMonitor()
+        # 🌟 修改: 传入依赖
+        self.position_monitor = PositionMonitor(self.market_data_provider, self.trading_executor)
         self.performance_analyzer = PerformanceAnalyzer()
         
         self.cycle_count = 0
@@ -2109,11 +2518,11 @@ class DeepSeekTradingBot:
             # 重置每日统计
             trading_state.reset_daily_stats()
             
-            # 1. 监控当前持仓
-            logger.info("👀 监控当前持仓...")
+            # 1. 监控当前持仓 (包含条件止损检查)
+            logger.info("👀 监控当前持仓 (含条件止损检查)...")
             self.position_monitor.monitor_all_positions()
             
-            # 2. 输出实时统计
+            # 2. 输出实时统计 (包含夏普比率更新)
             if trading_state.should_print_stats():
                 self.performance_analyzer.print_realtime_stats()
             
@@ -2165,15 +2574,15 @@ class DeepSeekTradingBot:
             try:
                 logger.info(f"📈 分析 {symbol}...")
                 
-                # 获取市场数据
+                # 获取市场数据 (V2 - 包含情绪)
                 market_data = self.market_data_provider.get_multi_timeframe_data(symbol)
                 if not market_data or not market_data['timeframes']:
                     continue
                 
-                # 多策略分析
+                # 多策略分析 (V2 - 包含情绪)
                 strategy_analysis = self.strategy_engine.analyze_symbol(symbol, market_data['timeframes'])
                 
-                # AI决策
+                # AI决策 (V2 - 传入情绪)
                 signal_data = self.ai_engine.generate_trading_signal(symbol, market_data, strategy_analysis)
                 
                 # 🚀 AI决策模式：使用AI信心度作为主要过滤条件
@@ -2273,9 +2682,9 @@ class DeepSeekTradingBot:
         
         # 🚀 AI决策模式：降低评分门槛
         if self.ai_mode_active:
-            min_score = 70  # AI模式下门槛稍低
+            min_score = 55  # AI模式下门槛稍低
         else:
-            min_score = 75  # 传统模式门槛较高
+            min_score = 65  # 传统模式门槛较高
         
         # 检查是否达到最低分数要求
         if best_opportunity['composite_score'] < min_score:
@@ -2291,11 +2700,11 @@ class DeepSeekTradingBot:
             logger.warning(f"🚨 达到日亏损限制: {trading_state.daily_pnl:.2%}")
             return False
         
-        # 交易频率检查
-        if (self.last_analysis_time and 
-            (datetime.now() - self.last_analysis_time).seconds < 300):
-            logger.info("⏰ 交易频率限制，等待...")
-            return False
+        # 交易频率检查 (V2.1: 改为10分钟周期，此检查可放宽或移除)
+        # if (self.last_analysis_time and 
+        #     (datetime.now() - self.last_analysis_time).seconds < 300):
+        #     logger.info("⏰ 交易频率限制，等待...")
+        #     return False
         
         # 持仓数量检查
         if len(trading_state.positions) >= TRADE_CONFIG['risk_management']['max_open_positions']:
@@ -2338,9 +2747,9 @@ class DeepSeekTradingBot:
 def setup_scheduling(bot):
     """设置定时任务"""
     
-    # 主要交易周期 - 每15分钟
-    schedule.every(15).minutes.do(bot.run_trading_cycle)
-    logger.info("⏰ 设置交易周期: 每15分钟")
+    # V2.1: 主要交易周期 - 每10分钟
+    schedule.every(10).minutes.do(bot.run_trading_cycle)
+    logger.info("⏰ 设置交易周期: 每10分钟")
     
     # 持仓监控 - 每5分钟
     schedule.every(5).minutes.do(bot.position_monitor.monitor_all_positions)
@@ -2407,12 +2816,18 @@ def main():
     global exchange  # 🚨 修复：在函数顶部声明 global
     
     print("\n" + "="*70)
-    print("🚀 DeepSeek AI合约交易机器人 - 完整优化版")
-    print("🎯 多策略决策 + 动态风控 + 投资组合管理 + 实时统计")
+    print("🚀 DeepSeek AI合约交易机器人 - 完整优化版 V2.1")
+    print("🎯 市场情绪 + 条件止损 + 夏普比率自适应")
     if TRADE_CONFIG['ai_decision_mode']['enabled']:
         print("🚀 AI决策主导模式已启用")
     print("="*70 + "\n")
     
+    # V2.1: 检查启动模式
+    if TRADE_CONFIG['test_mode']:
+        logger.info("🧪 测试模式启动 (使用 --test 标志)")
+    else:
+        logger.info("🔥 实盘模式启动 (默认)")
+        
     # 初始化交易所
     if not exchange:  # 🚨 现在这行在 global 声明之后
         logger.error("❌ 交易所初始化失败")
@@ -2474,7 +2889,7 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1:
         if sys.argv[1] == "--test":
-            logger.info("🧪 测试模式启动")
+            # V2.1: 命令行启动测试模式
             TRADE_CONFIG['test_mode'] = True
             main()
         elif sys.argv[1] == "--single":
@@ -2483,8 +2898,9 @@ if __name__ == "__main__":
             bot.run_trading_cycle()
         elif sys.argv[1] == "--monitor":
             logger.info("👀 仅监控模式")
-            monitor = PositionMonitor()
-            monitor.monitor_all_positions()
+            # 修复：monitor需要实例化
+            bot = DeepSeekTradingBot()
+            bot.position_monitor.monitor_all_positions()
         elif sys.argv[1] == "--stats":
             logger.info("📊 输出统计")
             analyzer = PerformanceAnalyzer()
@@ -2503,22 +2919,22 @@ if __name__ == "__main__":
             main()
         elif sys.argv[1] == "--help":
             print("""
-🤖 DeepSeek AI交易机器人 - 使用说明
+🤖 DeepSeek AI交易机器人 V2.1 - 使用说明
 
 命令:
-  python bot888.py              # 正常启动（15分钟周期）
-  python bot888.py --test       # 测试模式（不实际下单）
-  python bot888.py --single     # 单次分析
-  python bot888.py --monitor    # 仅监控持仓
-  python bot888.py --stats      # 输出实时统计
-  python bot888.py --report     # 生成日报
-  python bot888.py --ai-on      # 启用AI决策模式
-  python bot888.py --ai-off     # 关闭AI决策模式
-  python bot888.py --help       # 显示帮助
+  python ai88.py              # 正常启动 (实盘模式, 10分钟周期)
+  python ai88.py --test       # 测试模式 (不实际下单)
+  python ai88.py --single     # 单次分析
+  python ai88.py --monitor    # 仅监控持仓
+  python ai88.py --stats      # 输出实时统计
+  python ai88.py --report     # 生成日报
+  python ai88.py --ai-on      # 启用AI决策模式
+  python ai88.py --ai-off     # 关闭AI决策模式
+  python ai88.py --help       # 显示帮助
 
 PM2动态命令:
-  pm2 sendSignal SIGUSR1 88-trader  # 生成日报
-  pm2 sendSignal SIGUSR2 88-trader  # 输出统计
+  pm2 sendSignal SIGUSR1 <pm2_name>  # 生成日报
+  pm2 sendSignal SIGUSR2 <pm2_name>  # 输出统计
 
 配置:
   请确保 .env 文件中包含以下配置:
@@ -2527,20 +2943,22 @@ PM2动态命令:
   - OKX_SECRET / BINANCE_SECRET
   - OKX_PASSWORD (仅OKX需要)
 
-核心功能:
-  ✅ 多策略决策引擎（趋势/均值回归/突破）
+V2.1 核心功能:
+  ✅ 市场情绪分析 (资金费率 + 未平仓量)
+  ✅ 条件止损系统 (AI定义失效条件)
+  ✅ 夏普比率自适应风险 (根据历史表现调整仓位)
   ✅ DeepSeek AI智能决策（可开关）
+  ✅ 打印AI原始JSON回复
+  ✅ 10分钟交易周期
   ✅ 动态杠杆和仓位管理
   ✅ 严格风险控制系统
   ✅ 实时监控和统计（每30分钟）
   ✅ 自动止损止盈 + 移动止损
-  ✅ 连续亏损保护
   ✅ 完整的交易日志
   ✅ 小资金多币种支持
-  ✅ 24小时不间断运行
 
 风险提示:
-  ⚠️  请在测试模式充分验证后再使用实盘
+  ⚠️  默认启动为实盘模式！请使用 --test 充分验证
   ⚠️  建议从小资金开始
   ⚠️  严格监控机器人运行状态
   ⚠️  合约交易有爆仓风险，请谨慎操作
@@ -2549,5 +2967,5 @@ PM2动态命令:
             print(f"❓ 未知参数: {sys.argv[1]}")
             print("使用 --help 查看帮助")
     else:
-        # 正常启动
+        # 正常启动 (V2.1: 默认为实盘)
         main()
