@@ -1015,7 +1015,7 @@ class MultiStrategyEngine:
         else:
             return 'neutral'
 
-# ==================== 🎯 DeepSeek AI决策引擎 ====================
+# ==================== 🎯 DeepSeek AI决策引擎 (V2.1 优化版) ====================
 class DeepSeekDecisionEngine:
     """DeepSeek AI决策引擎"""
     
@@ -1036,11 +1036,10 @@ class DeepSeekDecisionEngine:
                 messages=[
                     {
                         "role": "system",
-                        "content": """你是一位急需数十万美元资金为女友治疗癌症的专业的量化交易员，擅长周期趋势分析加密货币合约交易。
-                        请基于K线形态技术分析和市场数据给出理性的交易决策。
-                        严格遵守风险管理和资金管理原则。
-                        只在高胜率机会时才建议交易。
-                        你的决策必须以 `json prompt.md` 中定义的严格JSON格式返回。"""
+                        "content": """你是一个世界级的量化交易AI，专注于高频和中频的加密货币合约交易。
+                        你的决策基于严格的数据分析、技术指标、市场情绪和风险管理原则。
+                        你的首要任务是资本保值，其次才是盈利。
+                        你必须始终以严格的JSON格式输出不要有任何额外文本。"""
                     },
                     {
                         "role": "user",
@@ -1048,7 +1047,7 @@ class DeepSeekDecisionEngine:
                     }
                 ],
                 temperature=0.1,
-                max_tokens=1500 # 增加token以容纳更复杂的prompt
+                max_tokens=1500
             )
             
             # V2.1: 打印AI原始回复
@@ -1063,7 +1062,7 @@ class DeepSeekDecisionEngine:
     
     # 🌟 修改: 更新AI Prompt
     def _build_ai_prompt(self, symbol, market_data, strategy_analysis):
-        """构建AI提示词 (V2 - 融合情绪和新JSON格式)"""
+        """构建AI提示词 (V2.1 - 融合情绪和新JSON格式)"""
         current_price = market_data['current_price']
         tf_data = list(market_data['timeframes'].values())[0]
         current = tf_data['current']
@@ -1087,6 +1086,16 @@ class DeepSeekDecisionEngine:
 - 情绪详情: {sentiment_data.get('details', 'N/A')}
 """
         
+        # 🌟 优化：生成策略摘要
+        strategy_summary = "策略分析摘要:\n"
+        strategies = strategy_analysis.get('strategies', {})
+        if strategies:
+            for name, result in strategies.items():
+                strategy_summary += f"- {name}: {result.get('direction', 'neutral')} (得分: {result.get('score', 50):.0f}, 信心: {result.get('confidence', 0.5):.0%})\n"
+        else:
+            strategy_summary += "- (无策略分析结果)\n"
+
+
         prompt = f"""
 作为专业量化交易员，请分析以下{symbol}交易机会：
 
@@ -1104,8 +1113,7 @@ class DeepSeekDecisionEngine:
 - 综合信心度: {strategy_analysis.get('final_confidence', 0):.1%}
 - 推荐方向: {strategy_analysis.get('recommended_direction', 'neutral')}
 
-策略详情:
-{json.dumps(strategy_analysis.get('strategies', {}), indent=2, ensure_ascii=False)}
+{strategy_summary}
 
 📈 技术指标状态 (15m):
 - RSI(14): {current.get('rsi_14', 50):.1f}
@@ -1127,20 +1135,20 @@ class DeepSeekDecisionEngine:
 - 最低信心度: {TRADE_CONFIG['ai_decision_mode']['min_confidence']:.2f}
 - 夏普比率低 (<1.0) 时请降低仓位和信心度。
 
-请严格按照以下JSON格式输出交易决策 (参考 json prompt.md)：
+请严格按照以下JSON格式输出交易决策 (注意: 所有数值字段必须返回数字，而不是字符串)：
 {{
     "signal": "BUY|SELL|HOLD",
     "coin": "{symbol}",
-    "confidence": 0.00-1.00,
+    "confidence": 0.85,
     "entry_price": {current_price},
-    "stop_loss": "具体价格",
-    "take_profit": "具体价格",
-    "leverage": {TRADE_CONFIG['leverage']['base_leverage']}-{TRADE_CONFIG['leverage']['max_leverage']}整数,
-    "position_size_percent": 0.05-0.25,
+    "stop_loss": 60000.50,
+    "take_profit": 65000.00,
+    "leverage": 10,
+    "position_size_percent": 0.15,
     "reason": "简明扼要的交易理由 (50字以内)",
     "justification": "详细分析逻辑，包括对技术面和情绪面的考量 (200字以内)",
-    "invalidation_condition": "基于技术指标的平仓条件 (例如: 'RSI<30' 或 'price<EMA50')",
-    "expected_risk_reward": "具体数值",
+    "invalidation_condition": "基于技术指标的平仓条件 (例如: '15m_RSI<30' 或 '5m_price<EMA50')",
+    "expected_risk_reward": 3.0,
     "time_horizon": "SHORT|MEDIUM|LONG"
 }}
 
@@ -1151,9 +1159,9 @@ class DeepSeekDecisionEngine:
 """
         return prompt
     
-    # 🌟 修改: 解析新的JSON字段
+    # 🌟 修改: 解析新的JSON字段并处理类型错误
     def _parse_ai_response(self, response_text, market_data, strategy_analysis):
-        """解析AI响应 (V2)"""
+        """解析AI响应 (V2.1 - 增强类型转换和回退机制)"""
         try:
             # 提取JSON部分
             start_idx = response_text.find('{')
@@ -1175,24 +1183,62 @@ class DeepSeekDecisionEngine:
             if TRADE_CONFIG['ai_decision_mode']['override_strategy']:
                 logger.info("🚀 AI决策模式：覆盖策略分析结果")
             
-            # 设置默认值
-            tf_data = list(market_data['timeframes'].values())[0]
-            current = tf_data['current']
-            
-            signal_data.setdefault('entry_price', market_data['current_price'])
-            signal_data.setdefault('leverage', 8)
-            signal_data.setdefault('position_size_percent', 0.1)
-            signal_data.setdefault('expected_risk_reward', 2.5)
-            signal_data.setdefault('time_horizon', 'MEDIUM')
-            
-            # 计算止损止盈（如果未提供）
-            if 'stop_loss' not in signal_data or 'take_profit' not in signal_data or not isinstance(signal_data['stop_loss'], (int, float)):
+            # --- 关键错误修复：对所有AI返回的数值进行严格的类型转换 ---
+            try:
+                current_price = market_data['current_price']
+                
+                # 转换核心数值
+                signal_data['confidence'] = float(signal_data.get('confidence', 0.0))
+                signal_data['entry_price'] = float(signal_data.get('entry_price', current_price))
+                signal_data['leverage'] = int(signal_data.get('leverage', TRADE_CONFIG['leverage']['base_leverage']))
+                signal_data['position_size_percent'] = float(signal_data.get('position_size_percent', 0.1))
+                
+                # 转换风险回报比
+                rr_val = signal_data.get('expected_risk_reward')
+                if isinstance(rr_val, (int, float)):
+                    signal_data['expected_risk_reward'] = float(rr_val)
+                else:
+                    # 尝试从字符串转换，如果失败，则在下面回退
+                    signal_data['expected_risk_reward'] = float(rr_val)
+
+                # 转换止损止盈
+                sl_val = signal_data.get('stop_loss')
+                tp_val = signal_data.get('take_profit')
+
+                if isinstance(sl_val, (int, float)):
+                    signal_data['stop_loss'] = float(sl_val)
+                else:
+                    # 如果是字符串 "具体价格" 或无效值，将触发 ValueError
+                    signal_data['stop_loss'] = float(sl_val)
+
+                if isinstance(tp_val, (int, float)):
+                    signal_data['take_profit'] = float(tp_val)
+                else:
+                    signal_data['take_profit'] = float(tp_val)
+
+            except (ValueError, TypeError) as e:
+                # 捕获任何转换失败
+                logger.warning(f"⚠️ AI返回的数值格式不正确: {e}. 将使用ATR重新计算 SL/TP 和 风险回报比...")
+                
+                # 回退到ATR计算
+                tf_data = list(market_data['timeframes'].values())[0]
+                current = tf_data['current']
+                atr = current.get('atr', market_data['current_price'] * 0.01) # 备用ATR
+                
                 stop_tp = self._calculate_stop_take_profit(
-                    signal_data['entry_price'],
+                    signal_data.get('entry_price', market_data['current_price']), # 使用已转换的 entry_price
                     signal_data['signal'],
-                    current['atr']
+                    atr
                 )
                 signal_data.update(stop_tp)
+                
+                # 重置风险回报比为配置
+                signal_data['expected_risk_reward'] = TRADE_CONFIG['risk_management']['risk_reward_ratio']
+                logger.info(f"🔄 已重新计算: SL={stop_tp['stop_loss']:.4f}, TP={stop_tp['take_profit']:.4f}")
+            # --- 修复结束 ---
+
+            # 设置默认值
+            signal_data.setdefault('time_horizon', 'MEDIUM')
             
             # 添加策略分析信息
             signal_data['strategy_score'] = strategy_analysis.get('final_score', 0)
@@ -1219,8 +1265,8 @@ class DeepSeekDecisionEngine:
             stop_loss = entry_price + atr * sl_multiple
             take_profit = entry_price - atr * tp_multiple
         else:
-            stop_loss = entry_price * 0.98
-            take_profit = entry_price * 1.02
+            stop_loss = entry_price * (1 - sl_multiple * 0.01) # 备用1% * multiplier
+            take_profit = entry_price * (1 + tp_multiple * 0.01)
         
         return {
             'stop_loss': stop_loss,
